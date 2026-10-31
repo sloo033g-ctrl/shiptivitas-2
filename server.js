@@ -1,9 +1,22 @@
 import express from 'express';
 import Database from 'better-sqlite3';
 
+const VALID_STATUSES = ['backlog', 'in-progress', 'complete'];
+
 const app = express();
 
 app.use(express.json());
+
+// Allow the React frontend (a different origin in development) to call this API.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  return next();
+});
 
 app.get('/', (req, res) => {
   return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
@@ -51,7 +64,7 @@ const validateId = (id) => {
  * @param {any} priority
  */
 const validatePriority = (priority) => {
-  if (Number.isNaN(priority)) {
+  if (!Number.isInteger(priority) || priority < 1) {
     return {
       valid: false,
       messageObj: {
@@ -95,7 +108,7 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
@@ -118,18 +131,58 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
 
-  /* ---------- Update code below ----------*/
+  if (status !== undefined && !VALID_STATUSES.includes(status)) {
+    return res.status(400).send({
+      'message': 'Invalid status provided.',
+      'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+    });
+  }
+  if (priority !== undefined) {
+    const { valid: priorityValid, messageObj: priorityMessage } = validatePriority(priority);
+    if (!priorityValid) {
+      return res.status(400).send(priorityMessage);
+    }
+  }
 
+  const client = db.prepare('select * from clients where id = ?').get(id);
+  const oldStatus = client.status;
+  const oldPriority = client.priority;
+  const newStatus = status === undefined ? oldStatus : status;
 
+  // Nothing to change.
+  if (status === undefined && priority === undefined) {
+    return res.status(200).send(db.prepare('select * from clients').all());
+  }
 
-  return res.status(200).send(clients);
+  // Run all updates as one transaction so priorities never end up half-updated.
+  const moveClient = db.transaction(() => {
+    // 1. Take the client out of its current swimlane and close the gap it leaves.
+    db.prepare('update clients set priority = priority - 1 where status = ? and priority > ?')
+      .run(oldStatus, oldPriority);
+
+    // 2. Work out the client's new priority within the target swimlane.
+    //    Lane size is counted without the client itself, so the last slot is size + 1.
+    const { count } = db.prepare('select count(*) as count from clients where status = ? and id != ?')
+      .get(newStatus, id);
+    // No priority given: keep it at the bottom of the new swimlane. Too large: clamp to the bottom.
+    const newPriority = priority === undefined ? count + 1 : Math.min(priority, count + 1);
+
+    // 3. Open a slot in the target swimlane by pushing everything at or below it down.
+    db.prepare('update clients set priority = priority + 1 where status = ? and id != ? and priority >= ?')
+      .run(newStatus, id, newPriority);
+
+    // 4. Put the client into that slot.
+    db.prepare('update clients set status = ?, priority = ? where id = ?')
+      .run(newStatus, newPriority, id);
+  });
+  moveClient();
+
+  return res.status(200).send(db.prepare('select * from clients').all());
 });
 
 app.listen(3001);
